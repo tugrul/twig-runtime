@@ -1,6 +1,6 @@
 {
   "name": "@tugrul/twig-runtime",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A high-performance, stream-based runtime library for executing transpiled Twig templates in JavaScript/TypeScript.",
   "keywords": [
     "twig",
