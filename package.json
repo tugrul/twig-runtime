@@ -2,7 +2,10 @@
   "name": "@tugrul/twig-runtime",
   "version": "1.0.0",
   "description": "A high-performance, stream-based runtime library for executing transpiled Twig templates in JavaScript/TypeScript.",
-  "keywords": ["twig", "template"],
+  "keywords": [
+    "twig",
+    "template"
+  ],
   "author": "Tuğrul Topuz <tugrultopuz@gmail.com>",
   "license": "MIT",
   "type": "module",
@@ -27,7 +30,6 @@
     "@types/jest": "^30.0.0",
     "@types/node": "^25.0.9",
     "jest": "^30.2.0",
-    "supertest": "^7.2.2",
     "ts-jest": "^29.4.6",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
