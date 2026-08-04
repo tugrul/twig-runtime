@@ -8,16 +8,20 @@ export type TwigFilter = (subject: unknown, ...args: any[]) => Promise<unknown>;
 export type TwigFunction = (...args: any[]) => Promise<unknown>;
 export type TwigFilterPipelineItem = [name: string, ...args: Array<unknown>];
 
+export type TwigMacro = (context: TwigTemplateContext, ...args: unknown[]) => Promise<string>;
+
 export interface TwigTemplate {
   name: string;
   extends?: string;
   blocks?: Record<string, TwigRenderFn>;
+  macros?: Record<string, TwigMacro>;
   main?: TwigRenderFn;
 }
 
 export interface TwigRuntimeOptions {
   loadBlob?: BlobLoader;
   blobOptions?: Record<string, unknown>;
+  escaper?: TwigEscaper;
 }
 
 export interface CaptureStreamOptions {
@@ -79,6 +83,111 @@ export function fileBlobLoader(this: BlobLoaderContext, hash: string): TwigReada
       }
     }
   });
+}
+
+/**
+ * A string that is already safe for output. `write()` accepts it directly
+ * and the `escape` filter passes it through untouched, which prevents
+ * double-escaping of rendered fragments (captured blocks, macro output,
+ * includes, parent() content).
+ */
+export class TwigMarkup {
+  constructor(public readonly content: string) {}
+
+  toString(): string {
+    return this.content;
+  }
+}
+
+export function markup(content: string | TwigMarkup): TwigMarkup {
+  return content instanceof TwigMarkup ? content : new TwigMarkup(content);
+}
+
+export type EscapeStrategy = (value: string) => string;
+
+const HTML_ESCAPES: Record<string, string> = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#039;',
+};
+
+/**
+ * Higher-order escape architecture: a registry of named strategies.
+ *
+ * Applications extend escaping in either of two ways:
+ * - grab the internal reference and register directly:
+ *     runtime.escaper.register('csv', (value) => ...);
+ * - or compose their own escaper up front and hand it to the runtime:
+ *     getRuntime({ escaper: myEscaper });
+ *
+ * The built-in `escape` filter is DERIVED from the escaper (see
+ * createEscapeFilter), so registered strategies become immediately
+ * usable in templates as `value|escape('csv')`.
+ */
+export class TwigEscaper {
+  private strategies = new Map<string, EscapeStrategy>();
+
+  constructor() {
+    this.register('html', (value) =>
+      value.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]));
+
+    this.register('js', (value) =>
+      value.replace(/[^a-zA-Z0-9,._]/gu, (c) => {
+        const code = c.codePointAt(0) as number;
+        if (code > 0xffff) return '\\u{' + code.toString(16).toUpperCase() + '}';
+        if (code > 0xff) return '\\u' + code.toString(16).toUpperCase().padStart(4, '0');
+        return '\\x' + code.toString(16).toUpperCase().padStart(2, '0');
+      }));
+
+    this.register('url', (value) => encodeURIComponent(value));
+
+    this.register('css', (value) =>
+      value.replace(/[^a-zA-Z0-9]/gu, (c) =>
+        '\\' + (c.codePointAt(0) as number).toString(16).toUpperCase() + ' '));
+
+    this.register('html_attr', (value) =>
+      value.replace(/[^a-zA-Z0-9,.\-_]/gu, (c) => {
+        const code = c.codePointAt(0) as number;
+        const named: Record<number, string> =
+          { 34: '&quot;', 38: '&amp;', 60: '&lt;', 62: '&gt;' };
+        return named[code] ?? '&#x' + code.toString(16).toUpperCase().padStart(2, '0') + ';';
+      }));
+  }
+
+  register(name: string, strategy: EscapeStrategy): this {
+    this.strategies.set(name, strategy);
+    return this;
+  }
+
+  get(name: string): EscapeStrategy {
+    const strategy = this.strategies.get(name);
+    if (!strategy) {
+      throw new Error(`Escape strategy not found: ${name}`);
+    }
+    return strategy;
+  }
+
+  escape(value: unknown, strategy = 'html'): TwigMarkup {
+    if (value instanceof TwigMarkup) {
+      return value;
+    }
+    if (value == null) {
+      return new TwigMarkup('');
+    }
+    return new TwigMarkup(this.get(strategy)(String(value)));
+  }
+}
+
+/**
+ * Build an `escape` filter bound to an escaper instance. Because the
+ * filter closes over the strategy registry, strategies registered later
+ * are picked up without re-registration.
+ */
+export function createEscapeFilter(escaper: TwigEscaper): TwigFilter {
+  return async (value: unknown, strategy: string = 'html') =>
+    escaper.escape(value, strategy);
 }
 
 export class TwigTemplateNode {
@@ -179,7 +288,7 @@ export class TwigTemplateContext {
     return result;
   }
 
-  write(chunk: string | Uint8Array | ArrayBufferLike): void {
+  write(chunk: string | TwigMarkup | Uint8Array | ArrayBufferLike): void {
     this.controller.enqueue(this.node.runtime.convertToUint8Array(chunk));
   }
 
@@ -233,6 +342,40 @@ export class TwigTemplateContext {
     }
   }
 
+  /** Wrap already-rendered content so escape passes it through. */
+  markup(content: string | TwigMarkup): TwigMarkup {
+    return markup(content);
+  }
+
+  /** Macros of a registered template, for cross-template imports. */
+  macros(name: string): Record<string, TwigMacro> {
+    return this.node.runtime.getNode(name).template.macros ?? {};
+  }
+
+  /** Stream another registered template into the current output. */
+  async include(
+    name: string,
+    vars: Record<string, unknown> = {},
+    options: { ignoreMissing?: boolean } = {}
+  ): Promise<void> {
+    if (options.ignoreMissing && !this.node.runtime.hasNode(name)) {
+      return;
+    }
+    await this.consumeStream(this.node.runtime.getNode(name).main(vars));
+  }
+
+  /** Render another registered template and capture it as a string. */
+  async getInclude(
+    name: string,
+    vars: Record<string, unknown> = {},
+    options: { ignoreMissing?: boolean } = {}
+  ): Promise<string> {
+    if (options.ignoreMissing && !this.node.runtime.hasNode(name)) {
+      return '';
+    }
+    return captureStream(this.node.runtime.getNode(name).main(vars));
+  }
+
   async getBlob(hash: string): Promise<string> {
     const stream = this.node.runtime.loadBlob(hash);
     return stream ? await captureStream(stream) : '';
@@ -254,10 +397,12 @@ export class TwigRuntime {
   filters = new Map<string, TwigFilter>();
   functions = new Map<string, TwigFunction>();
   options: TwigRuntimeOptions;
+  escaper: TwigEscaper;
   textEncoder = new TextEncoder();
 
   constructor(options: TwigRuntimeOptions = {}) {
     this.options = options;
+    this.escaper = options.escaper ?? new TwigEscaper();
   }
 
   loadBlob(hash: string): TwigReadableStream {
@@ -265,7 +410,11 @@ export class TwigRuntime {
     return loader.call({options: this.options.blobOptions ?? {}, runtime: this}, hash);
   }
 
-  convertToUint8Array(data: string | Uint8Array | ArrayBufferLike): Uint8Array {
+  convertToUint8Array(data: string | TwigMarkup | Uint8Array | ArrayBufferLike): Uint8Array {
+    if (data instanceof TwigMarkup) {
+      return this.textEncoder.encode(data.content);
+    }
+
     if (typeof data === 'string') {
       return this.textEncoder.encode(data);
     }
@@ -279,6 +428,10 @@ export class TwigRuntime {
     }
 
     throw new TypeError('Incompatible type');
+  }
+
+  hasNode(name: string): boolean {
+    return this.nodes.has(name);
   }
 
   getNode(name: string): TwigTemplateNode {
@@ -352,15 +505,7 @@ export function getRuntime(options: TwigRuntimeOptions = {}): TwigRuntime {
   const runtime = new TwigRuntime(options);
 
   runtime.registerFilters({
-    async escape(value) {
-      if (value == null) return '';
-      return String(value)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
-    }
+    escape: createEscapeFilter(runtime.escaper),
   });
 
   return runtime;

@@ -288,6 +288,18 @@ Apply filter pipeline.
 **`async execute(name: string, ...args: unknown[]): Promise<unknown>`**
 Execute a registered function.
 
+**`async include(name: string, vars?, options?: { ignoreMissing?: boolean }): Promise<void>`**
+Stream another registered template into the current output (no capture round-trip).
+
+**`async getInclude(name: string, vars?, options?): Promise<string>`**
+Render another registered template and capture it as a string.
+
+**`macros(name: string): Record<string, TwigMacro>`**
+Macros of another registered template, for cross-template `{% import %}`.
+
+**`markup(content: string): TwigMarkup`**
+Wrap already-rendered content so the `escape` filter passes it through.
+
 **`vars: Record<string, unknown>`**
 Access template variables.
 
@@ -297,7 +309,56 @@ Current block name (or null if in main template).
 ## Filters
 
 Built-in filter:
-- `escape` - HTML entity escaping
+- `escape` - strategy-based escaping (see below); defaults to `html`
+
+### Escape strategies (higher-order escaper)
+
+Escaping is built as a registry of named strategies (`TwigEscaper`), and
+the built-in `escape` filter is *derived* from it, so registered
+strategies immediately work in templates as `value|escape('name')`.
+Built-ins: `html`, `js`, `url`, `css`, `html_attr`.
+
+Two ways to extend:
+
+```typescript
+// 1. grab the internal reference and register directly
+const runtime = getRuntime();
+runtime.escaper.register('csv', (value) => `"${value.replace(/"/g, '""')}"`);
+
+// 2. or compose your own escaper up front
+import { TwigEscaper } from '@tugrul/twig-runtime';
+const escaper = new TwigEscaper().register('csv', myCsvStrategy);
+const runtime = getRuntime({ escaper });
+```
+
+### Safe strings (`TwigMarkup`)
+
+`escape` returns a `TwigMarkup` and passes existing `TwigMarkup` values
+through untouched, so already-rendered fragments (captured blocks, macro
+output, includes) are never double-escaped. `write()` accepts
+`TwigMarkup` directly; `context.markup(str)` wraps a string.
+
+### Macros
+
+Template stubs may carry a `macros` field of
+`(context, ...args) => Promise<string>` functions. Another template
+reaches them through the registry with `context.macros(name)` - this is
+what powers cross-template `{% import 'forms.twig' as f %}`.
+
+### Core library (`@tugrul/twig-runtime/core`)
+
+The kernel stays minimal by design. A tree-shakeable core library ships
+on a subpath export with JS-semantics filters (`upper`, `join`, `slice`,
+`map`, …) and functions (`range`, `max`, `min`, `cycle`, `has_some`,
+`has_every`):
+
+```typescript
+import { getRuntime } from '@tugrul/twig-runtime';
+import { registerCore, coreFilters } from '@tugrul/twig-runtime/core';
+
+const runtime = registerCore(getRuntime());
+// or cherry-pick: runtime.registerFilters({ upper: coreFilters.upper });
+```
 
 Register custom filters:
 

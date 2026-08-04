@@ -551,3 +551,127 @@ describe('TwigRuntime', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Compiler-integration features: macros, include, escaper, markup, core
+// ---------------------------------------------------------------------------
+
+import {
+  TwigEscaper,
+  TwigMarkup,
+  markup,
+  createEscapeFilter,
+  TwigTemplateContext,
+} from '../src/index.js';
+import { coreFilters, coreFunctions, registerCore } from '../src/core.js';
+
+describe('TwigMarkup & escaper', () => {
+  test('escape filter escapes html and passes TwigMarkup through', async () => {
+    const runtime = getRuntime();
+    const escape = runtime.filters.get('escape')!;
+
+    expect(String(await escape('<b>&"\'</b>'))).toBe('&lt;b&gt;&amp;&quot;&#039;&lt;/b&gt;');
+    expect(String(await escape(null))).toBe('');
+    expect(await escape(markup('<i>safe</i>'))).toBeInstanceOf(TwigMarkup);
+    expect(String(await escape(markup('<i>safe</i>')))).toBe('<i>safe</i>');
+    // double-escape is a no-op: escape returns TwigMarkup
+    expect(String(await escape(await escape('<x>')))).toBe('&lt;x&gt;');
+  });
+
+  test('built-in strategies: js, url, css, html_attr', async () => {
+    const escaper = new TwigEscaper();
+    expect(escaper.escape('a"b', 'js').content).toBe('a\\x22b');
+    expect(escaper.escape('a b&c', 'url').content).toBe('a%20b%26c');
+    expect(escaper.escape('a"b', 'css').content).toBe('a\\22 b');
+    expect(escaper.escape('a<b>', 'html_attr').content).toBe('a&lt;b&gt;');
+  });
+
+  test('custom strategies register through the runtime reference', async () => {
+    const runtime = getRuntime();
+    runtime.escaper.register('shout', (value) => value.toUpperCase() + '!');
+    const escape = runtime.filters.get('escape')!;
+    expect(String(await escape('hey', 'shout'))).toBe('HEY!');
+    expect(() => runtime.escaper.get('nope')).toThrow('Escape strategy not found: nope');
+  });
+
+  test('a composed escaper can be handed to the runtime', async () => {
+    const escaper = new TwigEscaper().register('brackets', (value) => `[${value}]`);
+    const runtime = getRuntime({ escaper });
+    expect(String(await runtime.filters.get('escape')!('x', 'brackets'))).toBe('[x]');
+  });
+
+  test('write() accepts TwigMarkup', async () => {
+    const runtime = new TwigRuntime();
+    runtime.register([{
+      name: 't',
+      async main() { this.write(this.markup('<raw/>')); },
+    }]);
+    expect(await captureStream(runtime.render('t'))).toBe('<raw/>');
+  });
+});
+
+describe('Macros field', () => {
+  test('context.macros() reaches another registered template', async () => {
+    const runtime = new TwigRuntime();
+    runtime.register([
+      {
+        name: 'forms.twig',
+        macros: {
+          async input(c: TwigTemplateContext, name: unknown) {
+            return `<input name="${name}"/>`;
+          },
+        },
+        async main() { /* empty */ },
+      },
+      {
+        name: 'page.twig',
+        async main() {
+          const f = this.macros('forms.twig');
+          this.write(this.markup(await f.input(this, 'user')));
+        },
+      },
+    ]);
+    expect(await captureStream(runtime.render('page.twig'))).toBe('<input name="user"/>');
+  });
+});
+
+describe('Native include', () => {
+  const partials: TwigTemplate[] = [
+    { name: 'card.twig', async main() { this.write(`[${this.vars.title}]`); } },
+    {
+      name: 'page.twig',
+      async main() {
+        this.write('A');
+        await this.include('card.twig', { title: 'T' });
+        await this.include('missing.twig', {}, { ignoreMissing: true });
+        this.write(await this.getInclude('card.twig', { title: 'C' }));
+        this.write('B');
+      },
+    },
+  ];
+
+  test('include streams; ignoreMissing skips; getInclude captures', async () => {
+    const runtime = new TwigRuntime();
+    runtime.register(partials);
+    expect(await captureStream(runtime.render('page.twig'))).toBe('A[T][C]B');
+  });
+
+  test('include of an unregistered template throws without ignoreMissing', async () => {
+    const runtime = new TwigRuntime();
+    runtime.register([{
+      name: 't',
+      async main() { await this.include('nope.twig'); },
+    }]);
+    await expect(captureStream(runtime.render('t'))).rejects.toThrow('Template not found: nope.twig');
+  });
+});
+
+describe('Core library (@tugrul/twig-runtime/core)', () => {
+  test('registerCore wires filters and functions', async () => {
+    const runtime = registerCore(getRuntime());
+    expect(String(await runtime.filters.get('upper')!('abc'))).toBe('ABC');
+    expect(await runtime.functions.get('range')!(1, 5, 2)).toEqual([1, 3, 5]);
+    expect(await coreFunctions.has_some!([1, 5], async (v: unknown) => (v as number) > 4)).toBe(true);
+    expect(await coreFilters.join!([1, 2, 3], ', ', ' and ')).toBe('1, 2 and 3');
+  });
+});
